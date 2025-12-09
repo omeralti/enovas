@@ -1,0 +1,11 @@
+build/
+app
+*.o
+*.a
+*.so
+.DS_Store
+*.swp
+*.swo
+*~
+.cache/
+
