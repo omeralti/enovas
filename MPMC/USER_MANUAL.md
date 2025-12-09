@@ -50,6 +50,16 @@ cmake --build build
 ./build/app
 ```
 
+## Docker İzin Sorunu (permission denied /var/run/docker.sock)
+Eğer `docker ps` veya `docker compose` komutlarında `permission denied ... /var/run/docker.sock` hatası alırsanız:
+```bash
+sudo groupadd docker         # grup yoksa; varsa "already exists" uyarısı normal
+sudo usermod -aG docker $USER
+newgrp docker                # yeni shell'de docker grubuna geçmek için
+docker ps                    # erişimi doğrula
+```
+Not: Yeni terminal açarsanız tekrar `newgrp docker` yapın veya docker grubuyla açılmış bir oturum kullanın.
+
 ## Notlar ve İzinler
 - Host dosyaları UID/GID 1000 ise `--user root` ile derlemek yazma izin sorunlarını önler. İsterseniz hostta `chown -R 1001:1001 /home/user/works/MPMC` yapıp `--user dev` ile çalışabilirsiniz.
 - Docker daemon erişimi için WSL’de `docker` grubunun etkin olduğu bir oturumda olun (`newgrp docker` veya yeni terminal).

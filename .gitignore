@@ -8,4 +8,5 @@ app
 *.swo
 *~
 .cache/
-
+MPMC/build/
+MPMC/app
