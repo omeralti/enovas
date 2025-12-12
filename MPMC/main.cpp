@@ -63,6 +63,94 @@ public:
         std::size_t* size_ptr;         // Ek metadata: yazılan byte sayısı
     };
 
+    // ========================================================================
+    // RAII Wrapper: Producer Ticket - Exception safety için
+    // ========================================================================
+    // Bu class, claim_producer() sonrası otomatik commit_producer() çağırır.
+    // Producer fail olsa bile (exception, early return) slot kaybolmaz.
+    // ========================================================================
+    class ProducerTicket {
+    public:
+        ProducerTicket(CircularBuffer* buffer, Ticket ticket)
+            : buffer_(buffer), ticket_(ticket), committed_(false) {}
+        
+        ~ProducerTicket() {
+            if (!committed_ && buffer_) {
+                // Exception veya early return durumunda otomatik commit
+                buffer_->commit_producer(ticket_);
+            }
+        }
+        
+        // Copy/move delete - sadece bir instance olmalı
+        ProducerTicket(const ProducerTicket&) = delete;
+        ProducerTicket& operator=(const ProducerTicket&) = delete;
+        ProducerTicket(ProducerTicket&&) = delete;
+        ProducerTicket& operator=(ProducerTicket&&) = delete;
+        
+        // Manuel commit (normal kullanım)
+        void commit() {
+            if (!committed_ && buffer_) {
+                buffer_->commit_producer(ticket_);
+                committed_ = true;
+            }
+        }
+        
+        // Ticket'a erişim
+        Ticket& get() { return ticket_; }
+        const Ticket& get() const { return ticket_; }
+        Ticket* operator->() { return &ticket_; }
+        const Ticket* operator->() const { return &ticket_; }
+        
+    private:
+        CircularBuffer* buffer_;
+        Ticket ticket_;
+        bool committed_;
+    };
+
+    // ========================================================================
+    // RAII Wrapper: Consumer Ticket - Exception safety için
+    // ========================================================================
+    // Bu class, claim_consumer() sonrası otomatik release_consumer() çağırır.
+    // Consumer fail olsa bile slot kaybolmaz.
+    // ========================================================================
+    class ConsumerTicket {
+    public:
+        ConsumerTicket(CircularBuffer* buffer, Ticket ticket)
+            : buffer_(buffer), ticket_(ticket), released_(false) {}
+        
+        ~ConsumerTicket() {
+            if (!released_ && buffer_) {
+                // Exception veya early return durumunda otomatik release
+                buffer_->release_consumer(ticket_);
+            }
+        }
+        
+        // Copy/move delete
+        ConsumerTicket(const ConsumerTicket&) = delete;
+        ConsumerTicket& operator=(const ConsumerTicket&) = delete;
+        ConsumerTicket(ConsumerTicket&&) = delete;
+        ConsumerTicket& operator=(ConsumerTicket&&) = delete;
+        
+        // Manuel release (normal kullanım)
+        void release() {
+            if (!released_ && buffer_) {
+                buffer_->release_consumer(ticket_);
+                released_ = true;
+            }
+        }
+        
+        // Ticket'a erişim
+        Ticket& get() { return ticket_; }
+        const Ticket& get() const { return ticket_; }
+        Ticket* operator->() { return &ticket_; }
+        const Ticket* operator->() const { return &ticket_; }
+        
+    private:
+        CircularBuffer* buffer_;
+        Ticket ticket_;
+        bool released_;
+    };
+
     // Constructor: buffer'ı belirtilen kapasite ve chunk boyutu ile başlatır
     CircularBuffer(std::size_t capacity_chunks, std::size_t chunk_size)
         : chunk_size_(chunk_size) {
@@ -101,73 +189,41 @@ public:
     }
 
     // ========================================================================
-    // Producer: Boş bir slot'u claim eder ve chunk pointer'ı döner
+    // Producer: Boş bir slot'u claim eder (non-blocking)
     // ========================================================================
-    // Bu fonksiyon lock-free çalışır: mutex kullanmaz, sadece atomik işlemler
-    // ve CAS (Compare-And-Swap) kullanır.
-    //
-    // AKIŞ:
-    // 1. tail_ (son yazılan pozisyon) oku
-    // 2. O pozisyondaki slot'un sequence'ını kontrol et
-    // 3. Eğer slot boşsa (seq == pos), CAS ile tail'i ilerlet
-    // 4. Başarılı olursa chunk pointer'ı döndür
-    // 5. Değilse backoff yap ve tekrar dene
-    //
-    // ÖNEMLİ: Bu fonksiyon döndükten sonra mutlaka commit_producer() çağrılmalı!
+    // Veri yoksa (kuyruk doluysa) veya shutdown ise hemen std::nullopt döner.
+    // Başarıyla claim ederse Ticket döner; devamında commit_producer() çağrılmalı.
     // ========================================================================
-    Ticket claim_producer() {
-        Backoff backoff;  // Contention durumunda bekleme stratejisi
-        while (true) {
-            // Shutdown kontrolü: eğer buffer kapatıldıysa çık
-            if (shutdown_.load(std::memory_order_acquire)) {
-                return Ticket{0, nullptr, nullptr, nullptr, nullptr};
-            }
-
-            // tail_: son yazılan pozisyon (atomik, birden fazla producer paylaşır)
-            // memory_order_relaxed yeterli çünkü sadece okuma yapıyoruz
-            std::size_t pos = tail_.load(std::memory_order_relaxed);
-            
-            // Ring buffer'da döngüsel indeks: pos & mask_ = pos % capacity_
-            Slot& slot = slots_[pos & mask_];
-            
-            // Slot'un sequence değerini oku
-            // memory_order_acquire: bu okumadan önceki tüm yazıları görürüz
-            std::size_t seq = slot.seq.load(std::memory_order_acquire);
-            
-            // Sequence kontrolü: slot'un durumunu anlamak için
-            // diff = seq - pos
-            // diff == 0  -> slot boş, producer yazabilir
-            // diff < 0   -> slot dolu, başka producer yazmış, bekle
-            // diff > 0   -> beklenmeyen durum (race condition?), bekle
-            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
-            
-            if (diff == 0) {  // Slot boş! Claim etmeyi dene
-                // CAS (Compare-And-Swap): atomik olarak tail'i ilerlet
-                // Eğer tail hala pos ise, pos+1 yap ve başarılı dön
-                // Eğer başka bir producer tail'i değiştirdiyse, başarısız ol ve tekrar dene
-                // memory_order_acq_rel: hem acquire hem release semantiği
-                if (tail_.compare_exchange_weak(pos, pos + 1,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_relaxed)) {
-                    // Başarılı! Bu slot'u claim ettik
-                    // CPU chunk başlangıcı
-                    char* cpu_p = data_cpu_.data() + (pos & mask_) * chunk_size_;
-                    // GPU chunk başlangıcı (short)
-                    short* gpu_p = data_gpu_.data() + (pos & mask_) * shorts_per_chunk_;
-                    // Metadata pointer'ları
-                    auto* rf = &meta_rf_signal_[pos & mask_];
-                    auto* sz = &meta_size_[pos & mask_];
-                    return Ticket{pos, cpu_p, gpu_p, rf, sz};  // Producer bu pointer'lara yazabilir
-                }
-                // CAS başarısız oldu (başka producer önce davrandı), tekrar dene
-            } else if (diff < 0) {  // Slot dolu, başka producer yazmış
-                // Consumer henüz okumamış, bekle
-                backoff();
-            } else {  // diff > 0: Beklenmeyen durum (çok nadir)
-                // Muhtemelen race condition, güvenli tarafta kal ve bekle
-                backoff();
-            }
+    std::optional<Ticket> claim_producer() {
+        // Shutdown kontrolü
+        if (shutdown_.load(std::memory_order_acquire)) {
+            return std::nullopt;
         }
+
+        // tail_: son yazılan pozisyon (atomik) - sadece okuyoruz, artırmıyoruz
+        std::size_t pos = tail_.load(std::memory_order_relaxed);
+
+        // Ring buffer index
+        Slot& slot = slots_[pos & mask_];
+
+        // Slot'un sequence değerini oku
+        std::size_t seq = slot.seq.load(std::memory_order_acquire);
+
+        // diff = seq - pos
+        intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+
+        if (diff == 0) {  // Slot boş, claim edilebilir
+            // tail_ artırmıyoruz, sadece slot'u döndürüyoruz
+            // tail_ commit_producer() içinde artırılacak
+            char* cpu_p = data_cpu_.data() + (pos & mask_) * chunk_size_;
+            short* gpu_p = data_gpu_.data() + (pos & mask_) * shorts_per_chunk_;
+            auto* rf = &meta_rf_signal_[pos & mask_];
+            auto* sz = &meta_size_[pos & mask_];
+            return Ticket{pos, cpu_p, gpu_p, rf, sz};
+        }
+
+        // Slot dolu (diff < 0) veya beklenmeyen durum (diff > 0) → veri yokmuş gibi çık
+        return std::nullopt;
     }
 
     // ========================================================================
@@ -175,6 +231,7 @@ public:
     // ========================================================================
     // Bu fonksiyon claim_producer()'dan sonra MUTLAKA çağrılmalı!
     //
+    // tail_ burada artırılır (claim_producer()'da değil).
     // Sequence'i pos+1 yaparak slot'u "dolu" olarak işaretleriz.
     // Consumer'lar seq == pos+1 olduğunu görünce bu slot'u okuyabilir.
     //
@@ -182,65 +239,76 @@ public:
     // veriler) consumer'lar tarafından görülebilir hale gelir.
     // ========================================================================
     void commit_producer(const Ticket& t) {
+        // tail_ artır: CAS ile atomik olarak ilerlet
+        // Sadece t.pos == tail_ ise artır (başka biri önce commit ettiyse false döner)
+        std::size_t expected = t.pos;
+        if (!tail_.compare_exchange_strong(expected, t.pos + 1,
+                                           std::memory_order_acq_rel,
+                                           std::memory_order_relaxed)) {
+            // Başka bir producer önce commit etti, bu ticket artık geçersiz
+            // Bu durumda slot'u commit etmiyoruz (tail_ zaten ilerledi)
+            return;
+        }
+        
         // Sequence'i pos+1 yap = "Bu slot dolu, consumer okuyabilir" sinyali
         slots_[t.pos & mask_].seq.store(t.pos + 1, std::memory_order_release);
     }
 
     // ========================================================================
-    // Consumer: Dolu bir slot'u claim eder ve chunk pointer'ı döner
+    // Producer: RAII wrapper ile claim (ÖNERİLEN - Exception safe)
     // ========================================================================
-    // Producer'ın tam tersi mantıkla çalışır:
+    // Bu fonksiyon ProducerTicket döndürür; destructor'da otomatik commit yapar.
+    // Producer fail olsa bile (exception, early return) slot kaybolmaz.
     //
-    // AKIŞ:
-    // 1. head_ (son okunan pozisyon) oku
-    // 2. O pozisyondaki slot'un sequence'ını kontrol et
-    // 3. Eğer slot doluysa (seq == pos + 1), CAS ile head'i ilerlet
-    // 4. Başarılı olursa chunk pointer'ı döndür
-    // 5. Değilse backoff yap ve tekrar dene
-    //
+    // KULLANIM:
+    //   if (auto ticket = buffer.claim_producer_raii()) {
+    //       // ticket->cpu_ptr, ticket->gpu_ptr, vs. kullan
+    //       ticket->commit();  // Manuel commit (isteğe bağlı, destructor zaten yapar)
+    //   }
+    // ========================================================================
+    std::optional<ProducerTicket> claim_producer_raii() {
+        auto opt = claim_producer();
+        if (!opt) return std::nullopt;
+        return ProducerTicket(this, *opt);
+    }
+
+    // ========================================================================
+    // Consumer: Dolu bir slot'u claim eder ve chunk pointer'ı döner (non-blocking)
+    // ========================================================================
+    // Veri yoksa hemen std::nullopt döner; spin/backoff yapmaz.
     // ÖNEMLİ: Bu fonksiyon döndükten sonra mutlaka release_consumer() çağrılmalı!
     // ========================================================================
     std::optional<Ticket> claim_consumer() {
-        Backoff backoff;
-        while (true) {
-            // head_: son okunan pozisyon (atomik, birden fazla consumer paylaşır)
-            std::size_t pos = head_.load(std::memory_order_relaxed);
-            
-            // Ring buffer'da döngüsel indeks
-            Slot& slot = slots_[pos & mask_];
-            
-            // Slot'un sequence değerini oku
-            std::size_t seq = slot.seq.load(std::memory_order_acquire);
-            
-            // Sequence kontrolü: slot'un durumunu anlamak için
-            // diff = seq - (pos + 1)
-            // diff == 0  -> slot dolu (seq == pos+1), consumer okuyabilir
-            // diff < 0   -> slot boş (seq < pos+1), producer henüz yazmamış, bekle
-            // diff > 0   -> beklenmeyen durum, bekle
-            intptr_t diff =
-                static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
-            
-            if (diff == 0) {  // Slot dolu! Claim etmeyi dene
-                // CAS ile head'i ilerlet
-                if (head_.compare_exchange_weak(pos, pos + 1,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_relaxed)) {
-                    // Başarılı! Bu slot'u claim ettik
-                    char* cpu_p = data_cpu_.data() + (pos & mask_) * chunk_size_;
-                    short* gpu_p = data_gpu_.data() + (pos & mask_) * shorts_per_chunk_;
-                    auto* rf = &meta_rf_signal_[pos & mask_];
-                    auto* sz = &meta_size_[pos & mask_];
-                    return Ticket{pos, cpu_p, gpu_p, rf, sz};  // Consumer bu pointer'lardan okuyabilir
-                }
-                // CAS başarısız oldu (başka consumer önce davrandı), tekrar dene
-            } else if (diff < 0) {  // Slot boş, producer henüz yazmamış
-                // Shutdown kontrolü: eğer buffer kapatıldıysa ve boşsa, çık
-                if (shutdown_.load(std::memory_order_acquire)) return std::nullopt;
-                backoff();  // Producer yazmasını bekle
-            } else {  // diff > 0: Beklenmeyen durum
-                backoff();
+        // head_: son okunan pozisyon (atomik, birden fazla consumer paylaşır)
+        std::size_t pos = head_.load(std::memory_order_relaxed);
+        
+        // Ring buffer'da döngüsel indeks
+        Slot& slot = slots_[pos & mask_];
+        
+        // Slot'un sequence değerini oku
+        std::size_t seq = slot.seq.load(std::memory_order_acquire);
+        
+        // diff = seq - (pos + 1)
+        intptr_t diff =
+            static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
+        
+        if (diff == 0) {  // Slot dolu! Claim etmeyi dene
+            if (head_.compare_exchange_weak(pos, pos + 1,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_relaxed)) {
+                // Başarılı! Bu slot'u claim ettik
+                char* cpu_p = data_cpu_.data() + (pos & mask_) * chunk_size_;
+                short* gpu_p = data_gpu_.data() + (pos & mask_) * shorts_per_chunk_;
+                auto* rf = &meta_rf_signal_[pos & mask_];
+                auto* sz = &meta_size_[pos & mask_];
+                return Ticket{pos, cpu_p, gpu_p, rf, sz};  // Consumer bu pointer'lardan okuyabilir
             }
+            // CAS başarısızsa başka consumer aldı; veri yokmuş gibi nullopt dön
+            return std::nullopt;
         }
+        
+        // Slot boş (diff < 0) ya da beklenmeyen durum (diff > 0) → veri yokmuş gibi çık
+        return std::nullopt;
     }
 
     // ========================================================================
@@ -265,6 +333,24 @@ public:
         // Sequence'i pos + capacity_ yap = "Bu slot boş, producer yazabilir" sinyali
         slots_[t.pos & mask_].seq.store(t.pos + capacity_,
                                         std::memory_order_release);
+    }
+
+    // ========================================================================
+    // Consumer: RAII wrapper ile claim (ÖNERİLEN - Exception safe)
+    // ========================================================================
+    // Bu fonksiyon ConsumerTicket döndürür; destructor'da otomatik release yapar.
+    // Consumer fail olsa bile slot kaybolmaz.
+    //
+    // KULLANIM:
+    //   if (auto ticket = buffer.claim_consumer_raii()) {
+    //       // ticket->cpu_ptr, ticket->gpu_ptr, vs. kullan
+    //       ticket->release();  // Manuel release (isteğe bağlı, destructor zaten yapar)
+    //   }
+    // ========================================================================
+    std::optional<ConsumerTicket> claim_consumer_raii() {
+        auto opt = claim_consumer();
+        if (!opt) return std::nullopt;
+        return ConsumerTicket(this, *opt);
     }
 
     // ========================================================================
@@ -414,9 +500,13 @@ int main() {
         for (int i = 0; i < items_per_producer; ++i) {
             int value = dist(rng);  // Rastgele bir değer
             
-            // 1. ADIM: Boş bir chunk claim et (lock-free)
-            auto ticket = buffer.claim_producer();
-            if (!ticket.cpu_ptr) break;  // Shutdown sinyali geldi, çık
+            // 1. ADIM: Boş bir chunk claim et (lock-free, non-blocking)
+            auto ticket_opt = buffer.claim_producer();
+            if (!ticket_opt.has_value()) {
+                // Kuyruk doluysa bu item'ı atla veya tekrar denemek istersen continue yaz.
+                continue;
+            }
+            auto& ticket = *ticket_opt;
 
             // 2. ADIM: Claim ettiğimiz chunk'a veri yaz
             // ticket.cpu_ptr, chunk'ın başlangıç adresidir

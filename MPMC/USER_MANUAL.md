@@ -60,7 +60,47 @@ docker ps                    # erişimi doğrula
 ```
 Not: Yeni terminal açarsanız tekrar `newgrp docker` yapın veya docker grubuyla açılmış bir oturum kullanın.
 
+## Test Suite Çalıştırma
+Kapsamlı test suite'i çalıştırmak için:
+```bash
+cd /workspace/MPMC
+# Test dosyası (test.cpp) zaten local'de mevcut
+g++ -std=c++20 -O2 -pthread test.cpp -o test_app
+./test_app
+```
+
+**Local'de çalıştırma:**
+```bash
+cd /home/user/works/MPMC/MPMC
+g++ -std=c++20 -O2 -pthread test.cpp -o test_app
+./test_app
+```
+
+Test suite şu testleri içerir:
+1. **test_basic_producer_consumer**: Temel producer/consumer işlevselliği
+2. **test_non_blocking**: Veri yoksa nullopt dönmesi
+3. **test_exception_safety**: Producer fail olsa bile slot kaybolmaması (tail_ commit'te artırılıyor)
+4. **test_multiple_producer_consumer**: Çoklu thread producer/consumer
+5. **test_shutdown**: Shutdown sonrası nullopt dönmesi
+6. **test_capacity_limit**: Buffer dolu olduğunda nullopt dönmesi
+7. **test_thread_safety**: Thread safety (race condition testi)
+8. **test_commit_increments_tail**: Commit sonrası tail artışı
+
 ## Notlar ve İzinler
 - Host dosyaları UID/GID 1000 ise `--user root` ile derlemek yazma izin sorunlarını önler. İsterseniz hostta `chown -R 1001:1001 /home/user/works/MPMC` yapıp `--user dev` ile çalışabilirsiniz.
-- Docker daemon erişimi için WSL’de `docker` grubunun etkin olduğu bir oturumda olun (`newgrp docker` veya yeni terminal).
+- Docker daemon erişimi için WSL'de `docker` grubunun etkin olduğu bir oturumda olun (`newgrp docker` veya yeni terminal).
+
+## Permission Denied Sorunu (WSL)
+Docker container içinde root olarak oluşturulan dosyalar host'ta da root sahipliğinde kalır. Bu yüzden `user` kullanıcısı yazamaz.
+
+**Çözüm:**
+```bash
+# Klasör sahipliğini düzelt
+sudo chown -R user:user /home/user/works/MPMC/MPMC
+
+# Veya tüm MPMC klasörü için
+sudo chown -R user:user /home/user/works/MPMC
+```
+
+**Önleme:** Container içinde dosya oluştururken `--user dev` kullanın veya host'ta dosya oluşturun.
 
